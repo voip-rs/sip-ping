@@ -1,0 +1,53 @@
+#!/bin/bash
+# Pre-commit hook to check Cargo.lock placement, formatting, clippy, docs, and tests
+
+set -e
+
+# Cargo.lock belongs only on the detached commit a release tag points at, so a
+# release build resolves an exact dependency set while master stays a library
+# crate with the lock gitignored. Detached HEAD is the whole signal: on a
+# branch, staging it is always the "forgot to git checkout --detach" mistake.
+if git diff --cached --name-only --diff-filter=AM | grep -qx 'Cargo.lock'; then
+    if git symbolic-ref -q HEAD >/dev/null; then
+        echo "Cargo.lock is staged on branch $(git symbolic-ref --short HEAD)."
+        echo "It may only be committed on the release tag's own detached commit."
+        echo "Run 'git checkout --detach' first, then stage and commit it."
+        exit 1
+    fi
+fi
+
+echo "Running cargo fmt check..."
+if ! cargo fmt --all -- --check; then
+    echo "Code is not formatted. Run 'cargo fmt --all' to fix."
+    exit 1
+fi
+
+echo "Running cargo clippy..."
+if ! cargo clippy --all-targets --message-format=short -- -D warnings; then
+    echo "Clippy found warnings. Fix them before committing."
+    exit 1
+fi
+
+echo "Checking documentation coverage..."
+if ! doc_output=$(RUSTDOCFLAGS="-D missing_docs -D rustdoc::broken_intra_doc_links" cargo doc --no-deps 2>&1); then
+    echo "$doc_output" | grep '^error' | head -20
+    echo "Documentation errors. Run: RUSTDOCFLAGS='-D missing_docs -D rustdoc::broken_intra_doc_links' cargo doc --no-deps"
+    exit 1
+fi
+
+echo "Running tests..."
+if ! test_output=$(cargo test 2>&1); then
+    echo "$test_output" | tail
+    echo "Tests failed. Fix them before committing."
+    exit 1
+fi
+
+if command -v gitleaks &>/dev/null; then
+    echo "Running gitleaks..."
+    if ! gitleaks git --staged --no-banner; then
+        echo "gitleaks found secrets in staged changes."
+        exit 1
+    fi
+fi
+
+echo "Pre-commit checks passed"

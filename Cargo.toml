@@ -1,0 +1,30 @@
+[package]
+name = "sip-ping"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+authors = ["Jerome Poulin <jeromepoulin@gmail.com>"]
+description = "SIP ping utility"
+license = "GPL-3.0-only"
+repository = "https://github.com/ticpu/sip-ping"
+readme = "README.md"
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "sip-ping"
+path = "src/main.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+strip = true
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+fastrand = "2"
+native-tls = "0.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tungstenite = "0.24"
