@@ -373,7 +373,7 @@ fn main() {
             }
         }
         Err(e) => {
-            eprintln!("{}: {e}", args.host);
+            eprintln!("{}: {e:#}", args.host);
             process::exit(1);
         }
     }
