@@ -25,6 +25,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 fastrand = "2"
 native-tls = "0.2"
+socket2 = "0.6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tungstenite = "0.24"

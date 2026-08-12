@@ -1,17 +1,16 @@
 //! Ping a SIP server using OPTIONS requests.
 
 use std::fmt;
-use std::io::{Read, Write as _};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
+use std::io::{ErrorKind, Read, Write as _};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::process;
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
+use socket2::{Domain, Socket, Type};
 use tracing::{debug, info};
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const READ_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_RESPONSE: usize = 65536;
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -52,6 +51,66 @@ impl fmt::Display for Protocol {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Family {
+    Any,
+    V4,
+    V6,
+}
+
+impl Family {
+    fn of(addr: &SocketAddr) -> Self {
+        if addr.is_ipv4() {
+            Self::V4
+        } else {
+            Self::V6
+        }
+    }
+
+    fn accepts(self, addr: &SocketAddr) -> bool {
+        self == Self::Any || self == Self::of(addr)
+    }
+}
+
+impl fmt::Display for Family {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Any => "IP",
+            Self::V4 => "IPv4",
+            Self::V6 => "IPv6",
+        })
+    }
+}
+
+/// Local endpoint to bind before connecting.
+struct Source {
+    ip: Option<IpAddr>,
+    port: u16,
+}
+
+impl Source {
+    fn local_for(&self, remote: &SocketAddr) -> SocketAddr {
+        let ip = self
+            .ip
+            .unwrap_or(match Family::of(remote) {
+                Family::V4 => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                _ => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            });
+        SocketAddr::new(ip, self.port)
+    }
+}
+
+struct Target {
+    /// Resolvable `host:port`, port defaulted from the transport.
+    addr: String,
+    /// Host exactly as given, used in the SIP URIs.
+    host: String,
+    family: Family,
+    source: Source,
+    timeout: Duration,
+    skip_verify: bool,
+}
+
 /// Ping a SIP server using OPTIONS requests
 #[derive(Parser)]
 #[command(version, about)]
@@ -60,11 +119,37 @@ struct Args {
     host: String,
 
     /// Transport protocol
-    #[arg(short, long, value_enum, default_value_t = Protocol::Udp)]
+    #[arg(short = 't', long, value_enum, default_value_t = Protocol::Udp)]
     protocol: Protocol,
 
+    /// Source address to bind
+    #[arg(short = 's', long, value_name = "ADDR")]
+    source: Option<IpAddr>,
+
+    /// Source port to bind
+    #[arg(short = 'p', long, value_name = "PORT", default_value_t = 0)]
+    source_port: u16,
+
+    /// Connect and read timeout, in seconds
+    #[arg(
+        short = 'w',
+        long,
+        value_name = "SECS",
+        default_value_t = 5,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    timeout: u64,
+
+    /// Use IPv4 only
+    #[arg(short = '4', conflicts_with = "ipv6")]
+    ipv4: bool,
+
+    /// Use IPv6 only
+    #[arg(short = '6')]
+    ipv6: bool,
+
     /// Skip TLS certificate verification
-    #[arg(short, long)]
+    #[arg(long)]
     skip_verify: bool,
 
     /// Increase verbosity
@@ -113,36 +198,94 @@ fn ensure_port(host: &str, default_port: u16) -> String {
     format!("{host}:{default_port}")
 }
 
-fn resolve(addr: &str) -> Result<Vec<SocketAddr>> {
-    let addrs: Vec<_> = addr
+/// A bound source address pins the family; `-4`/`-6` may only agree with it.
+fn address_family(ipv4: bool, ipv6: bool, source: Option<IpAddr>) -> Result<Family> {
+    let requested = match (ipv4, ipv6) {
+        (true, _) => Family::V4,
+        (_, true) => Family::V6,
+        _ => Family::Any,
+    };
+    let Some(ip) = source else {
+        return Ok(requested);
+    };
+    let bound = if ip.is_ipv4() { Family::V4 } else { Family::V6 };
+    if requested != Family::Any && requested != bound {
+        bail!("source address {ip} is not {requested}");
+    }
+    Ok(bound)
+}
+
+fn resolve(addr: &str, family: Family) -> Result<Vec<SocketAddr>> {
+    let all: Vec<_> = addr
         .to_socket_addrs()
         .with_context(|| format!("resolving {addr}"))?
         .collect();
-    if addrs.is_empty() {
+    if all.is_empty() {
         bail!("no addresses for {addr}");
     }
-    Ok(addrs)
+    let matching: Vec<_> = all
+        .into_iter()
+        .filter(|sa| family.accepts(sa))
+        .collect();
+    if matching.is_empty() {
+        bail!("no {family} addresses for {addr}");
+    }
+    Ok(matching)
 }
 
-fn connect_tcp(addr: &str) -> Result<TcpStream> {
-    let addrs = resolve(addr)?;
+fn first_reachable<T>(
+    target: &Target,
+    mut connect: impl FnMut(&SocketAddr) -> std::io::Result<T>,
+) -> Result<T> {
+    let addrs = resolve(&target.addr, target.family)?;
     let mut last_err = None;
     for sa in &addrs {
         info!("connecting to {sa}");
-        match TcpStream::connect_timeout(sa, CONNECT_TIMEOUT) {
-            Ok(stream) => {
-                stream.set_read_timeout(Some(READ_TIMEOUT))?;
-                return Ok(stream);
-            }
+        match connect(sa) {
+            Ok(connected) => return Ok(connected),
             Err(e) => {
                 info!("connect failed: {e}");
                 last_err = Some(e);
             }
         }
     }
-    Err(last_err
-        .unwrap_or_else(|| std::io::Error::other("no addresses"))
-        .into())
+    // `resolve` rejects an empty list, so the loop ran at least once.
+    Err(anyhow!(last_err.expect("no address was tried")))
+}
+
+fn connect_udp(target: &Target) -> Result<UdpSocket> {
+    let socket = first_reachable(target, |sa| {
+        let local = target
+            .source
+            .local_for(sa);
+        debug!("binding {local}");
+        let socket = UdpSocket::bind(local)?;
+        socket.connect(sa)?;
+        Ok(socket)
+    })
+    .context("connecting")?;
+    socket.set_read_timeout(Some(target.timeout))?;
+    Ok(socket)
+}
+
+fn connect_tcp(target: &Target) -> Result<TcpStream> {
+    let stream: TcpStream = first_reachable(target, |sa| {
+        let local = target
+            .source
+            .local_for(sa);
+        debug!("binding {local}");
+        let socket = Socket::new(
+            Domain::for_address(*sa),
+            Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )?;
+        socket.bind(&local.into())?;
+        socket.connect_timeout(&(*sa).into(), target.timeout)?;
+        Ok(socket.into())
+    })
+    .context("connecting")?;
+    stream.set_read_timeout(Some(target.timeout))?;
+    Ok(stream)
 }
 
 fn build_sip_options(protocol: Protocol, local_addr: &str, host: &str) -> String {
@@ -182,7 +325,18 @@ fn build_sip_options(protocol: Protocol, local_addr: &str, host: &str) -> String
     }
 }
 
-fn read_sip_response(stream: &mut impl Read) -> Result<String> {
+/// A read timeout reaches us as `WouldBlock` on a blocking socket, which reads
+/// as `EAGAIN` and tells nobody what actually happened.
+fn read_error(e: std::io::Error, timeout: Duration) -> anyhow::Error {
+    match e.kind() {
+        ErrorKind::WouldBlock | ErrorKind::TimedOut => {
+            anyhow!("no response within {}s", timeout.as_secs())
+        }
+        _ => anyhow!(e),
+    }
+}
+
+fn read_sip_response(stream: &mut impl Read, timeout: Duration) -> Result<String> {
     let mut buf = vec![0u8; MAX_RESPONSE];
     let mut total = 0;
     loop {
@@ -191,6 +345,7 @@ fn read_sip_response(stream: &mut impl Read) -> Result<String> {
         }
         let n = stream
             .read(&mut buf[total..])
+            .map_err(|e| read_error(e, timeout))
             .context("reading response")?;
         if n == 0 {
             break;
@@ -217,19 +372,12 @@ fn status_line(response: &str) -> &str {
         .trim()
 }
 
-fn ping_udp(addr: &str, host: &str) -> Result<(String, Duration)> {
-    let socket = UdpSocket::bind("[::]:0")
-        .or_else(|_| UdpSocket::bind("0.0.0.0:0"))
-        .context("binding UDP socket")?;
-    socket.set_read_timeout(Some(READ_TIMEOUT))?;
-    socket
-        .connect(addr)
-        .context("connecting")?;
-
+fn ping_udp(target: &Target) -> Result<(String, Duration)> {
+    let socket = connect_udp(target)?;
     let local = socket
         .local_addr()?
         .to_string();
-    let request = build_sip_options(Protocol::Udp, &local, host);
+    let request = build_sip_options(Protocol::Udp, &local, &target.host);
     debug!("SIP request:\n{request}");
 
     let start = Instant::now();
@@ -240,6 +388,7 @@ fn ping_udp(addr: &str, host: &str) -> Result<(String, Duration)> {
     let mut buf = vec![0u8; MAX_RESPONSE];
     let n = socket
         .recv(&mut buf)
+        .map_err(|e| read_error(e, target.timeout))
         .context("receiving")?;
     let elapsed = start.elapsed();
 
@@ -248,32 +397,33 @@ fn ping_udp(addr: &str, host: &str) -> Result<(String, Duration)> {
     Ok((response, elapsed))
 }
 
-fn ping_tcp(addr: &str, host: &str) -> Result<(String, Duration)> {
-    let mut stream = connect_tcp(addr)?;
+fn ping_tcp(target: &Target) -> Result<(String, Duration)> {
+    let mut stream = connect_tcp(target)?;
     let local = stream
         .local_addr()?
         .to_string();
-    let request = build_sip_options(Protocol::Tcp, &local, host);
+    let request = build_sip_options(Protocol::Tcp, &local, &target.host);
     debug!("SIP request:\n{request}");
 
     let start = Instant::now();
     stream
         .write_all(request.as_bytes())
         .context("sending")?;
-    let response = read_sip_response(&mut stream)?;
+    let response = read_sip_response(&mut stream, target.timeout)?;
     let elapsed = start.elapsed();
 
     debug!("SIP response:\n{response}");
     Ok((response, elapsed))
 }
 
-fn ping_tls(addr: &str, host: &str, skip_verify: bool) -> Result<(String, Duration)> {
-    let tcp = connect_tcp(addr)?;
+fn ping_tls(target: &Target) -> Result<(String, Duration)> {
+    let tcp = connect_tcp(target)?;
     let connector = native_tls::TlsConnector::builder()
-        .danger_accept_invalid_certs(skip_verify)
+        .danger_accept_invalid_certs(target.skip_verify)
         .build()
         .context("building TLS connector")?;
 
+    let host = &target.host;
     let sni_host = if host.starts_with('[') {
         host.split(']')
             .next()
@@ -292,31 +442,57 @@ fn ping_tls(addr: &str, host: &str, skip_verify: bool) -> Result<(String, Durati
         .get_ref()
         .local_addr()?
         .to_string();
-    let request = build_sip_options(Protocol::Tls, &local, host);
+    let request = build_sip_options(Protocol::Tls, &local, &target.host);
     debug!("SIP request:\n{request}");
 
     let start = Instant::now();
     stream
         .write_all(request.as_bytes())
         .context("sending")?;
-    let response = read_sip_response(&mut stream)?;
+    let response = read_sip_response(&mut stream, target.timeout)?;
     let elapsed = start.elapsed();
 
     debug!("SIP response:\n{response}");
     Ok((response, elapsed))
 }
 
-fn ping_ws(addr: &str, host: &str) -> Result<(String, Duration)> {
+/// A read timeout surfaces as `Interrupted` rather than an error, so the
+/// handshake is resumed until it completes or the timeout is spent.
+fn ws_handshake(
+    request: tungstenite::ClientRequestBuilder,
+    tcp: TcpStream,
+    timeout: Duration,
+) -> Result<tungstenite::WebSocket<TcpStream>> {
+    use tungstenite::HandshakeError;
+
+    let deadline = Instant::now() + timeout;
+    let mut attempt = tungstenite::client::client(request, tcp);
+    loop {
+        match attempt {
+            Ok((ws, _)) => return Ok(ws),
+            Err(HandshakeError::Failure(e)) => return Err(anyhow!(e)),
+            Err(HandshakeError::Interrupted(mid)) => {
+                if Instant::now() >= deadline {
+                    bail!("no response within {}s", timeout.as_secs());
+                }
+                attempt = mid.handshake();
+            }
+        }
+    }
+}
+
+fn ping_ws(target: &Target) -> Result<(String, Duration)> {
     use tungstenite::{ClientRequestBuilder, Message};
 
-    let uri: tungstenite::http::Uri = format!("ws://{addr}")
+    let tcp = connect_tcp(target)?;
+    let uri: tungstenite::http::Uri = format!("ws://{}", target.addr)
         .parse()
         .context("parsing WS URI")?;
     let request = ClientRequestBuilder::new(uri).with_sub_protocol("sip");
 
-    let (mut ws, _) = tungstenite::connect(request).context("WebSocket connect")?;
+    let mut ws = ws_handshake(request, tcp, target.timeout).context("WebSocket connect")?;
 
-    let sip_request = build_sip_options(Protocol::Ws, "", host);
+    let sip_request = build_sip_options(Protocol::Ws, "", &target.host);
     debug!("SIP request:\n{sip_request}");
 
     let start = Instant::now();
@@ -341,29 +517,44 @@ fn ping_ws(addr: &str, host: &str) -> Result<(String, Duration)> {
     Ok((response, elapsed))
 }
 
-fn main() {
-    let args = Args::parse();
-    init_tracing(args.verbose);
-
-    let addr = ensure_port(
-        &args.host,
-        args.protocol
-            .default_port(),
-    );
+fn run(args: &Args) -> Result<(String, Duration)> {
+    let target = Target {
+        addr: ensure_port(
+            &args.host,
+            args.protocol
+                .default_port(),
+        ),
+        host: args
+            .host
+            .clone(),
+        family: address_family(args.ipv4, args.ipv6, args.source)?,
+        source: Source {
+            ip: args.source,
+            port: args.source_port,
+        },
+        timeout: Duration::from_secs(args.timeout),
+        skip_verify: args.skip_verify,
+    };
     info!(
-        "pinging {addr} via {}",
+        "pinging {} via {}",
+        target.addr,
         args.protocol
             .sip_transport()
     );
 
-    let result = match args.protocol {
-        Protocol::Udp => ping_udp(&addr, &args.host),
-        Protocol::Tcp => ping_tcp(&addr, &args.host),
-        Protocol::Tls => ping_tls(&addr, &args.host, args.skip_verify),
-        Protocol::Ws => ping_ws(&addr, &args.host),
-    };
+    match args.protocol {
+        Protocol::Udp => ping_udp(&target),
+        Protocol::Tcp => ping_tcp(&target),
+        Protocol::Tls => ping_tls(&target),
+        Protocol::Ws => ping_ws(&target),
+    }
+}
 
-    match result {
+fn main() {
+    let args = Args::parse();
+    init_tracing(args.verbose);
+
+    match run(&args) {
         Ok((response, elapsed)) => {
             let status = status_line(&response);
             let ms = elapsed.as_secs_f64() * 1000.0;
